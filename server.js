@@ -37,8 +37,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
-const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPYGwiUK0J7";
-const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "gleah6423@gmail.com";
+const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPYdTTFT7Pi";
+const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "streetmaster878@gmail.com";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_PASS;
 
 if (!MONGO_URI) {
