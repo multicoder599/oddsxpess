@@ -1692,7 +1692,7 @@ app.get('/api/health', function(req, res) {
 // ==========================================
 // START SERVER
 // ==========================================
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 4007;
 server.listen(PORT, function() {
     console.log("🚀 Server live on port " + PORT);
 });
