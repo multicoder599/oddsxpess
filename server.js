@@ -37,8 +37,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
-const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPY91S96crn";
-const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "streetmaster878@gmail.com";
+const MEGAPAY_API_KEY = process.env.MEGAPAY_API_KEY || "MGPYGwiUK0J7";
+const MEGAPAY_EMAIL = process.env.MEGAPAY_EMAIL || "gleah6423@gmail.com";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || process.env.ADMIN_PASS;
 
 if (!MONGO_URI) {
@@ -982,6 +982,10 @@ async function settleBetsCore(forceAll) {
                     const game = await LiveGame.findOne({ home: teams[0].trim(), away: teams[1].trim() });
                     if (game && game.commenceTime) {
                         matchStartTime = new Date(game.commenceTime).getTime();
+                    } else if (game && game.time) {
+                        // Legacy injected rows without commenceTime
+                        const parsedKick = parseKickoffFromTimeString(game.time);
+                        if (parsedKick) matchStartTime = parsedKick.getTime();
                     }
                 }
                 const minutesSinceStart = (Date.now() - matchStartTime) / 60000;
@@ -1204,7 +1208,12 @@ app.post('/api/games', requireDB, async (req, res) => {
         const { games, mode } = req.body;
         if (mode === 'replace') await LiveGame.deleteMany({});
         const formattedGames = games.map(function(g) {
-            return { ...g, commenceTime: g.commenceTime ? new Date(g.commenceTime) : undefined };
+            // Admin feeds often omit commenceTime and only carry a Kenyan
+            // kickoff string in `time` — derive the kickoff so the
+            // live / HT / FT lifecycle runs on these games too.
+            let ct = g.commenceTime ? new Date(g.commenceTime) : null;
+            if (!ct || isNaN(ct.getTime())) ct = parseKickoffFromTimeString(g.time);
+            return { ...g, commenceTime: ct || undefined };
         });
         await LiveGame.insertMany(formattedGames);
         res.json({ success: true, message: "Games updated" });
@@ -1249,6 +1258,25 @@ function computeDisplayMinute(diffMins) {
     if (diffMins <= 50) return Math.min(diffMins, 45);
     if (diffMins <= 65) return 45;
     return diffMins - 20;
+}
+
+// Parse admin-injected kickoff strings ("Today, 18:30", "Tomorrow 20:00",
+// "18:30") into a real Date. Day anchors use Africa/Nairobi time (UTC+3, no
+// DST) — that is the audience timezone even if the server runs in UTC.
+function parseKickoffFromTimeString(timeStr) {
+    if (!timeStr || typeof timeStr !== 'string') return null;
+    var m = timeStr.match(/(today|tomorrow)?[^0-9]*(\d{1,2}):(\d{2})/i);
+    if (!m) return null;
+    var dayOffset = m[1] ? (m[1].toLowerCase() === 'tomorrow' ? 1 : 0) : 0;
+    var nairobiNow = new Date(Date.now() + 3 * 3600 * 1000); // shift clock to UTC+3
+    var kickUtc = Date.UTC(
+        nairobiNow.getUTCFullYear(),
+        nairobiNow.getUTCMonth(),
+        nairobiNow.getUTCDate() + dayOffset,
+        parseInt(m[2], 10) - 3, // Nairobi hour -> UTC
+        parseInt(m[3], 10)
+    );
+    return new Date(kickUtc);
 }
 
 // ==========================================
@@ -1358,21 +1386,40 @@ app.get('/api/games', async (req, res) => {
             allGames = allGames.concat(cachedApiGames);
         }
 
-        allGames = allGames.map(function(g) {
-            // Games injected by admin without a kickoff time keep their injected
-            // status ('upcoming'). Previously diffMins fell back to 0 and every
-            // such game was flipped to 'live', making it disappear from the feed.
+        allGames = await Promise.all(allGames.map(async function(g) {
+            // Legacy rows injected without a kickoff: derive one from the
+            // Kenyan kickoff string in `time` ("Today, 18:30") when possible.
+            if (!g.commenceTime) {
+                const parsedKick = parseKickoffFromTimeString(g.time);
+                if (parsedKick) g.commenceTime = parsedKick;
+            }
+            // Games with no kickoff info at all keep their injected status.
             if (!g.commenceTime) return g;
             const diffMins = Math.floor((Date.now() - new Date(g.commenceTime).getTime()) / 60000);
             const matchName = g.home + " vs " + g.away;
             if (diffMins >= 120 || g.status === 'finished') {
+                // FULL TIME: lock the score and drop out of the feed. Mint a
+                // final result if the admin didn't fix one, so the scoreboard
+                // and the settlement engine agree on the same score.
                 g.status = 'finished';
                 g.time = 'FT';
                 if (resultsMap.has(matchName)) {
                     g.hs = resultsMap.get(matchName).hs;
                     g.as = resultsMap.get(matchName).as;
+                } else {
+                    let newRes = await MatchResult.findOneAndUpdate(
+                        { matchName: matchName },
+                        { $setOnInsert: { hs: Math.floor(Math.random() * 4), as: Math.floor(Math.random() * 3), status: 'FINISHED' } },
+                        { upsert: true, new: true }
+                    );
+                    g.hs = newRes.hs;
+                    g.as = newRes.as;
+                    resultsMap.set(matchName, newRes);
                 }
             } else if (diffMins >= 0 && diffMins < 120) {
+                // LIVE: minutes tick 1'..45', 45+, HT, then 46'..90', 90+.
+                // Scores come from the admin-fixed result when one exists,
+                // otherwise from a deterministic progress simulation.
                 g.status = 'live';
                 g.min = computeLiveMinute(diffMins);
                 const fixedRes = resultsMap.get(matchName);
@@ -1382,10 +1429,18 @@ app.get('/api/games', async (req, res) => {
                     const displayMin = computeDisplayMinute(diffMins);
                     g.hs = hTimes.filter(t => t <= displayMin).length;
                     g.as = aTimes.filter(t => t <= displayMin).length;
+                } else {
+                    const displayMin = computeDisplayMinute(diffMins);
+                    const progress = Math.min(displayMin, 90) / 90;
+                    const hOdds = parseFloat(g.odds) || 2;
+                    const aOdds = parseFloat(g.away_odds) || 2;
+                    const homeAdv = (1 / hOdds) >= (1 / aOdds) ? 1.5 : 0.5;
+                    g.hs = Math.floor(progress * homeAdv * 2.2);
+                    g.as = Math.floor(progress * (2 - homeAdv) * 1.8);
                 }
             }
             return g;
-        });
+        }));
 
         res.json({ success: true, games: allGames });
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to aggregate games' }); }
@@ -1692,7 +1747,7 @@ app.get('/api/health', function(req, res) {
 // ==========================================
 // START SERVER
 // ==========================================
-const PORT = process.env.PORT || 4061;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, function() {
     console.log("🚀 Server live on port " + PORT);
 });
