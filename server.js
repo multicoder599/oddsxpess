@@ -1207,16 +1207,24 @@ app.post('/api/games', requireDB, async (req, res) => {
     try {
         const { games, mode } = req.body;
         if (mode === 'replace') await LiveGame.deleteMany({});
-        const formattedGames = games.map(function(g) {
+        // Skip duplicates inside the payload itself (merged provider feeds
+        // often contain the same fixture several times).
+        const seenKeys = new Set();
+        const formattedGames = [];
+        let skippedDupes = 0;
+        for (const g of games) {
+            const key = ((g.home || '') + ' vs ' + (g.away || '')).trim().toLowerCase();
+            if (!key || seenKeys.has(key)) { skippedDupes++; continue; }
+            seenKeys.add(key);
             // Admin feeds often omit commenceTime and only carry a Kenyan
             // kickoff string in `time` — derive the kickoff so the
             // live / HT / FT lifecycle runs on these games too.
-            let ct = g.commenceTime ? new Date(g.commenceTime) : null;
-            if (!ct || isNaN(ct.getTime())) ct = parseKickoffFromTimeString(g.time);
-            return { ...g, commenceTime: ct || undefined };
-        });
+            let ct = normalizeCommenceTime(g.commenceTime);
+            if (!ct) ct = parseKickoffFromTimeString(g.time);
+            formattedGames.push({ ...g, commenceTime: ct || undefined });
+        }
         await LiveGame.insertMany(formattedGames);
-        res.json({ success: true, message: "Games updated" });
+        res.json({ success: true, message: "Games updated: " + formattedGames.length + " inserted, " + skippedDupes + " duplicates skipped." });
     } catch (error) {
         res.status(500).json({ success: false, message: 'Failed to inject games' });
     }
@@ -1277,6 +1285,17 @@ function parseKickoffFromTimeString(timeStr) {
         parseInt(m[3], 10)
     );
     return new Date(kickUtc);
+}
+
+// Accept ISO strings, millisecond epochs and SECONDS epochs. Generator feeds
+// often emit Unix seconds — raw `new Date(seconds)` lands in 1970, which the
+// lifecycle immediately marks 'finished', hiding the game from the frontend.
+function normalizeCommenceTime(v) {
+    if (v === undefined || v === null || v === '') return null;
+    var d;
+    if (typeof v === 'number') d = new Date(v < 1e12 ? v * 1000 : v);
+    else d = new Date(v);
+    return isNaN(d.getTime()) ? null : d;
 }
 
 // ==========================================
@@ -1386,10 +1405,28 @@ app.get('/api/games', async (req, res) => {
             allGames = allGames.concat(cachedApiGames);
         }
 
+        // DB games and Odds-API games can overlap (admin may inject fixtures
+        // that also come from the API) — keep the first occurrence so the
+        // frontend never renders the same match twice.
+        const seenGameKeys = new Set();
+        allGames = allGames.filter(function(g) {
+            const key = (g.id !== undefined && g.id !== null && g.id !== '')
+                ? 'id:' + String(g.id)
+                : 'm:' + ((g.home || '') + ' vs ' + (g.away || '')).trim().toLowerCase();
+            if (seenGameKeys.has(key)) return false;
+            seenGameKeys.add(key);
+            return true;
+        });
+
         allGames = await Promise.all(allGames.map(async function(g) {
-            // Legacy rows injected without a kickoff: derive one from the
-            // Kenyan kickoff string in `time` ("Today, 18:30") when possible.
-            if (!g.commenceTime) {
+            // Normalize junk kickoffs (epoch seconds arrive as 1970 dates),
+            // then derive one from the Kenyan kickoff string in `time`
+            // ("Today, 18:30") for legacy rows.
+            const normCt = normalizeCommenceTime(g.commenceTime);
+            if (normCt) {
+                g.commenceTime = normCt;
+            } else {
+                if (g.commenceTime) g.commenceTime = undefined;
                 const parsedKick = parseKickoffFromTimeString(g.time);
                 if (parsedKick) g.commenceTime = parsedKick;
             }
